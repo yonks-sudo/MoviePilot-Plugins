@@ -8,7 +8,7 @@
     "author": "yonks-sudo",
     "level": 2,
     "history": {
-      "v2.6": "Docker容器适配：三处浏览器启动入口统一添加 --no-sandbox 与 --disable-dev-shm-usage，修复 root 容器内 Edge/Chrome 实例直接退出导致 cookie 校验与登录持续失败的问题",
+      "v2.6": "Docker容器适配与驱动持久化：统一添加 --no-sandbox 与 --disable-dev-shm-usage 修复 root 容器内 Edge 启动崩溃；新增 WebDriver 驱动与 Edge 浏览器持久卷定位/自举（容器重建或升级后自动从本仓库恢复驱动，支持代理+重试）",
       "v2.5": "添加自动化浏览器选择",
       "v2.4.4": "优化后台进程管理",
       "v2.4.3": "添加无头模式切换",
