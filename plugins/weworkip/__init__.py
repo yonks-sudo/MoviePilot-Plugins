@@ -1,6 +1,8 @@
 import base64
 import re
 import os
+import shutil
+import subprocess
 import time
 from urllib.parse import urljoin
 import requests
@@ -21,6 +23,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.edge.service import Service as EdgeService
 
 class WeWorkIP(_PluginBase):
     # 插件名称
@@ -99,6 +102,178 @@ class WeWorkIP(_PluginBase):
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
 
+    # ===== 持久化浏览器资产 =====
+    # 驱动与 Edge 本体随镜像层(overlay)存在,容器重建或 MoviePilot 升级后会丢失,
+    # 导致 webdriver.Edge 报 "session not created: Chrome instance exited" 或找不到驱动。
+    # 因此驱动二进制同时托管在本插件仓库 drivers/msedgedriver,可由仓库自举恢复;
+    # 浏览器本体约 673MB,超过 GitHub 单文件 100MB 限制无法入库,
+    # 必须预置在持久卷 /config/browsers/ 下(该卷独立于镜像层,重建后保留)。
+    DRIVE_VERSION = "156.0.4314.42"
+    PERSIST_BROWSERS = "/config/browsers"
+    EDGE_DRIVER_GITHUB = "https://raw.githubusercontent.com/yonks-sudo/MoviePilot-Plugins/main/drivers/msedgedriver"
+    # 代理地址列表;raw.githubusercontent.com 在容器内无法直连,必须走代理。
+    # 取自容器全局变量 PROXY_HOST,去重后保留。
+    EDGE_PROXY_URLS = tuple(dict.fromkeys(filter(None, [os.environ.get("PROXY_HOST"), "http://192.168.31.199:1082"])))
+    # 每次下载尝试次数。代理连接偶发被重置,单次下载不可靠,需重试。
+    EDGE_DOWNLOAD_RETRIES = 3
+    _drive_path = None
+    _edge_binary = None
+
+    def _locate_browser_assets(self) -> None:
+        """定位或恢复 WebDriver 驱动与 Edge 可执行文件。
+
+        容器重建后镜像层内的驱动与浏览器缓存会丢失,这里优先使用持久卷副本,
+        驱动缺失时从本插件 GitHub 仓库下载恢复。
+        """
+        self._drive_path = self._resolve_driver()
+        self._edge_binary = self._resolve_edge_binary()
+        if self._drive_path:
+            logger.info(f"WebDriver 驱动路径: {self._drive_path}")
+        else:
+            logger.error("未找到可用的 WebDriver 驱动,浏览器相关功能将不可用")
+        if self._edge_binary:
+            logger.info(f"Edge 可执行文件: {self._edge_binary}")
+        else:
+            logger.error(
+                "未找到持久化的 Edge 浏览器。浏览器本体不在 GitHub 仓库中"
+                f"(超过 100MB 限制),请将其放入 {self.PERSIST_BROWSERS}/edge-{self.DRIVE_VERSION}/msedge"
+            )
+
+    def _resolve_driver(self) -> Optional[str]:
+        """返回可用的 msedgedriver 路径,缺失时尝试从仓库下载。"""
+        target = os.path.join(self.PERSIST_BROWSERS, "msedgedriver")
+        for candidate in (target, "/usr/local/bin/msedgedriver"):
+            if self._is_valid_driver(candidate):
+                return candidate
+        return self._download_driver(target)
+
+    @staticmethod
+    def _is_valid_driver(path: str) -> bool:
+        """校验驱动文件存在、可读且体积合理。"""
+        try:
+            return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 1024 * 1024
+        except OSError:
+            return False
+
+    def _download_driver(self, target: str) -> Optional[str]:
+        """从本插件 GitHub 仓库下载驱动到持久卷。
+
+        优先使用 curl(带代理),因为容器内 requests 经代理访问
+        raw.githubusercontent.com 会被重置;requests 作为兜底方案保留。
+        """
+        for attempt in range(1, self.EDGE_DOWNLOAD_RETRIES + 1):
+            result = self._download_driver_once(target)
+            if result:
+                return result
+            if attempt < self.EDGE_DOWNLOAD_RETRIES:
+                logger.warning(f"驱动下载未成功,第 {attempt}/{self.EDGE_DOWNLOAD_RETRIES} 次尝试失败,准备重试")
+        logger.error(f"无法从仓库恢复 WebDriver 驱动:{self.EDGE_DRIVER_GITHUB}")
+        return None
+
+    def _download_driver_once(self, target: str) -> Optional[str]:
+        """执行一轮下载:确保持久卷目录存在后依次尝试各下载通道。"""
+        try:
+            os.makedirs(self.PERSIST_BROWSERS, exist_ok=True)
+        except OSError as e:
+            logger.error(f"创建持久卷目录失败:{e}")
+            return None
+        for src, ok in (
+            ("curl+代理", self._curl_download(target, use_proxy=True)),
+            ("curl直连", self._curl_download(target, use_proxy=False)),
+            ("requests", self._requests_download(target)),
+        ):
+            if ok:
+                logger.info(f"已从仓库恢复 WebDriver 驱动到 {target}(方式:{src})")
+                return target
+        return None
+
+    def _curl_download(self, target: str, use_proxy: bool = True, rounds: int = 3) -> bool:
+        """使用 curl 下载驱动到临时文件,返回是否成功。
+
+        代理连接偶发被重置,故在通道内部也做有限轮重试。
+        """
+        if not shutil.which("curl"):
+            return False
+        tmp = target + ".tmp"
+        proxy_arg = ["-x", os.environ.get("PROXY_HOST", "http://192.168.31.199:1082")] if use_proxy else []
+        cmd = ["curl", "-sS", "--fail", "--max-time", "180", *proxy_arg, "-o", tmp, self.EDGE_DRIVER_GITHUB]
+        try:
+            for _ in range(rounds):
+                try:
+                    ret = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+                    if ret.returncode != 0:
+                        logger.debug(f"curl 下载驱动失败:rc={ret.returncode}, {ret.stderr[:120]}")
+                        continue
+                    if os.path.getsize(tmp) > 1024 * 1024:
+                        return True
+                except Exception as e:
+                    logger.debug(f"curl 下载驱动失败:{e}")
+            return False
+        finally:
+            self._finalize_download(tmp, target)
+
+    def _requests_download(self, target: str, rounds: int = 3) -> bool:
+        """使用 requests 下载驱动到临时文件,依次尝试各代理与直连。"""
+        tmp = target + ".tmp"
+        proxies_list = [{"http://": u, "https://": u} for u in self.EDGE_PROXY_URLS] + [{}]
+        try:
+            for _ in range(rounds):
+                for proxies in proxies_list:
+                    try:
+                        resp = requests.get(self.EDGE_DRIVER_GITHUB, proxies=proxies, timeout=(15, 180))
+                        if resp.status_code == 200 and resp.content and len(resp.content) > 1024 * 1024:
+                            with open(tmp, "wb") as f:
+                                f.write(resp.content)
+                            return True
+                    except Exception as e:
+                        logger.debug(f"requests 下载驱动失败:{e}")
+            return False
+        finally:
+            self._finalize_download(tmp, target)
+
+    @staticmethod
+    def _finalize_download(tmp: str, target: str) -> None:
+        """校验临时文件并原子替换到目标路径。"""
+        try:
+            if os.path.isfile(tmp) and os.path.getsize(tmp) > 1024 * 1024:
+                os.replace(tmp, target)
+                os.chmod(target, 0o755)
+            elif os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError as e:
+            logger.error(f"保存 WebDriver 驱动失败:{e}")
+
+    def _resolve_edge_binary(self) -> Optional[str]:
+        """返回持久卷内的 Edge 可执行文件路径。
+
+        Selenium Manager 把浏览器缓存到 $HOME/.cache/selenium 下,该目录位于镜像层,
+        容器重建后丢失。这里只接受真实存储位置在持久卷内的可执行文件。
+        """
+        candidates = [
+            os.path.join(settings.CONFIG_PATH, "browsers", f"edge-{self.DRIVE_VERSION}", "msedge"),
+            os.path.join(self.PERSIST_BROWSERS, f"edge-{self.DRIVE_VERSION}", "msedge"),
+        ]
+        for path in candidates:
+            try:
+                if not (os.path.isfile(path) and os.path.getsize(path) > 1024 * 1024 * 100):
+                    continue
+                if self._is_on_ephemeral_layer(path):
+                    logger.warning(f"{path} 实际位于镜像层缓存,跳过")
+                    continue
+                return path
+            except OSError as e:
+                logger.debug(f"检查 {path} 失败:{e}")
+        return None
+
+    @staticmethod
+    def _is_on_ephemeral_layer(path: str) -> bool:
+        """判断文件真实存储位置是否在容器镜像层(Selenium Manager 缓存目录)。"""
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            return False
+        return "/.cache/selenium/" in real
+
     def init_plugin(self, config: dict = None):
         # 清空配置
         self._wechatUrl = ""
@@ -148,6 +323,11 @@ class WeWorkIP(_PluginBase):
            self._check_cron = "*/11 * * * *"
         if self._browser == None:
             self._browser = "edge"
+        # 定位或恢复持久化驱动与浏览器,失败不阻塞插件初始化
+        try:
+            self._locate_browser_assets()
+        except Exception as e:
+            logger.error(f"定位浏览器资产失败:{e}")
         # 停止现有任务
         self.stop_service()
 
@@ -288,8 +468,11 @@ class WeWorkIP(_PluginBase):
         # 容器 root 环境必须禁用沙箱,否则浏览器启动即崩溃
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        if self._edge_binary:
+            options.add_argument(f"--binary={self._edge_binary}")
+        service = EdgeService(executable_path=self._drive_path) if self._drive_path else None
         if self._browser == "edge":
-            driver = webdriver.Edge(options=options)
+            driver = webdriver.Edge(options=options, service=service)
         else:
             driver = webdriver.Chrome(options=options)
         time.sleep(2)#旧版无头模式似乎会出问题,尝试等待解决
@@ -367,8 +550,11 @@ class WeWorkIP(_PluginBase):
             # 容器 root 环境必须禁用沙箱,否则浏览器启动即崩溃
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
+            if self._edge_binary:
+                options.add_argument(f"--binary={self._edge_binary}")
+            service = EdgeService(executable_path=self._drive_path) if self._drive_path else None
             if self._browser == "edge":
-                driver = webdriver.Edge(options=options)
+                driver = webdriver.Edge(options=options, service=service)
             else:
                 driver = webdriver.Chrome(options=options)
             time.sleep(2)#旧版无头模式似乎会出问题,尝试等待解决
@@ -480,8 +666,11 @@ class WeWorkIP(_PluginBase):
             # 容器 root 环境必须禁用沙箱,否则浏览器启动即崩溃
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
+            if self._edge_binary:
+                options.add_argument(f"--binary={self._edge_binary}")
+            service = EdgeService(executable_path=self._drive_path) if self._drive_path else None
             if self._browser == "edge":
-                driver = webdriver.Edge(options=options)
+                driver = webdriver.Edge(options=options, service=service)
             else:
                 driver = webdriver.Chrome(options=options)
             self._driver = driver
