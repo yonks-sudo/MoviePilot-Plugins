@@ -26,15 +26,15 @@ class WeWorkIP(_PluginBase):
     # 插件名称
     plugin_name = "企微配置IP"
     # 插件描述
-    plugin_desc = "!!Docker用户请使用Docker版!!定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。"
+    plugin_desc = "定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。Docker容器适配版：已内置 --no-sandbox/--disable-dev-shm-usage，解决 root 容器内 Edge 启动崩溃导致登录失败的问题。"
     # 插件图标
     plugin_icon = "https://github.com/suraxiuxiu/MoviePilot-Plugins/blob/main/icons/micon.png?raw=true"
     # 插件版本
-    plugin_version = "2.5"
+    plugin_version = "2.6"
     # 插件作者
-    plugin_author = "suraxiuxiu"
+    plugin_author = "yonks-sudo"
     # 作者主页
-    author_url = "https://github.com/suraxiuxiu/MoviePilot-Plugins"
+    author_url = "https://github.com/yonks-sudo/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "weworkip_"
     # 加载顺序
@@ -285,6 +285,9 @@ class WeWorkIP(_PluginBase):
             options.add_argument("--headless=old")
         else:
             options.add_argument("--headless")
+        # 容器 root 环境必须禁用沙箱,否则浏览器启动即崩溃
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
         if self._browser == "edge":
             driver = webdriver.Edge(options=options)
         else:
@@ -361,6 +364,9 @@ class WeWorkIP(_PluginBase):
                 options.add_argument("--headless=old")
             else:
                 options.add_argument("--headless")
+            # 容器 root 环境必须禁用沙箱,否则浏览器启动即崩溃
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
             if self._browser == "edge":
                 driver = webdriver.Edge(options=options)
             else:
@@ -471,6 +477,9 @@ class WeWorkIP(_PluginBase):
                 options.add_argument("--headless=old")
             else:
                 options.add_argument("--headless")
+            # 容器 root 环境必须禁用沙箱,否则浏览器启动即崩溃
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
             if self._browser == "edge":
                 driver = webdriver.Edge(options=options)
             else:
